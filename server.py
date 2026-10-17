@@ -259,6 +259,16 @@ async def robot_ws(request: web.Request):
 
 def main():
     load_key()  # fail early with a clear message
+    # Warm up the heavy imports NOW (a slow free CPU would otherwise freeze the
+    # first robot connection for ~10 s and make it time out waiting for hello).
+    t0 = time.monotonic()
+    from google import genai  # noqa: F401
+    from google.genai import types  # noqa: F401
+    try:
+        codec.make_codec()
+    except Exception as e:
+        print("OPUS warm-up error:", e, flush=True)
+    print("warm-up done in %.1f s" % (time.monotonic() - t0), flush=True)
     app = web.Application()
     app.router.add_route("*", "/xiaozhi/ota/", ota)
     app.router.add_get("/xiaozhi/v1/", robot_ws)
