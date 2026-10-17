@@ -1,4 +1,5 @@
 """Opus <-> PCM helpers. Tries PyAV first (pip only), then opuslib (needs opus.dll)."""
+from fractions import Fraction
 
 MIC_RATE = 16000      # robot microphone sample rate
 SPK_RATE = 24000      # rate we tell the robot to expect
@@ -47,7 +48,7 @@ class _AvCodec:
         fr.sample_rate = SPK_RATE
         fr.planes[0].update(pcm24k)
         fr.pts = self.pts
-        fr.time_base = self.av.Fraction(1, SPK_RATE)
+        fr.time_base = Fraction(1, SPK_RATE)
         self.pts += SPK_SAMPLES
         return [bytes(p) for p in self.enc.encode(fr)]
 

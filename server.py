@@ -59,6 +59,8 @@ async def ota(request: web.Request):
     # behind a proxy (GitHub Codespaces) the real scheme/host come in these headers
     host = request.headers.get("X-Forwarded-Host", request.host)
     secure = request.headers.get("X-Forwarded-Proto", "http").split(",")[0].strip() == "https"
+    if host.endswith((".onrender.com", ".github.dev")) or os.environ.get("FORCE_WSS") == "1":
+        secure = True
     scheme = "wss" if secure else "ws"
     body = {
         "server_time": {"timestamp": int(time.time() * 1000), "timezone_offset": 60},
@@ -66,6 +68,10 @@ async def ota(request: web.Request):
     }
     log("OTA check from", request.remote, "->", body["websocket"]["url"])
     return web.json_response(body)
+
+
+async def health(request: web.Request):
+    return web.Response(text="ok")
 
 
 # ---------------------------------------------------------------- one robot connection
@@ -256,6 +262,8 @@ def main():
     app = web.Application()
     app.router.add_route("*", "/xiaozhi/ota/", ota)
     app.router.add_get("/xiaozhi/v1/", robot_ws)
+    app.router.add_get("/health", health)
+    app.router.add_get("/", health)
     print("=" * 60)
     cs_name = os.environ.get("CODESPACE_NAME")
     if cs_name:
