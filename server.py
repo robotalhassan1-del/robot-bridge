@@ -24,8 +24,50 @@ SYSTEM_PROMPT = (
     "Sunanka Robot. Kai mataimaki ne mai fara'a a cikin wani karamin robot a gidan Alhassan a Nigeria. "
     "Ka fahimci Hausa, kuma KA AMSA DA HAUSA KAWAI sai dai idan mutum ya nemi wani harshe. "
     "Ka yi gajerun amsoshi (jimla daya zuwa uku) domin ana jin su ta lasifika. "
-    "Kada ka yi amfani da alamomi ko emoji. Ka yi magana a hankali da bayyananniyar murya."
+    "Kada ka yi amfani da alamomi ko emoji. Ka yi magana a hankali da bayyananniyar murya. "
+    "Kana iya sarrafa na'urorin gidan ta hanyar kayan aiki (tools): fitila, fanka, da karanta zafi da danshin dakin. "
+    "Idan mutum ya nemi ka kunna ko ka kashe fitila ko fanka, ka yi amfani da kayan aikin da ya dace, "
+    "sannan ka tabbatar masa da Hausa abin da ya faru. Kada ka ce ka yi aiki sai ka ga kayan aikin ya yi nasara. "
+    "Idan mutum ya ce 'idan zafi ya kai 39 ka kunna fanka' (ko makamancin haka), ka yi amfani da kayan aikin "
+    "saita ka'idar fanka (set_fan_rule) da lambar zafin da ya fada. "
+    "Idan ka karbi sako da ya fara da [TSARO], hatsari ne na gaske: ka yi magana nan da nan, da murya mai karfi da gaggawa."
 )
+
+ALERT_PROMPTS = {
+    "ALERT_FIRE": (
+        "[TSARO] Na'urar gano wuta ta ga WUTA a gidan yanzu! Ka yi magana nan take da Hausa, da murya mai karfi da gaggawa: "
+        "ka gargadi mutane su fita daga gidan, su kashe wutar kawai idan za su iya cikin aminci, kuma su kira masu kashe gobara. "
+        "Kada ka yi tambaya. Jimla biyu zuwa uku kawai."
+    ),
+    "ALERT_GAS": (
+        "[TSARO] Na'urar gano iskar gas ko hayaki ta gano GAS ko HAYAKI a gidan yanzu! Ka yi magana nan take da Hausa, "
+        "da murya mai karfi da gaggawa: ka gargadi mutane su bude kofofi da tagogi, kada su kunna wuta ko su danna wani switch, "
+        "su rufe gas idan za su iya, kuma su fita waje. Kada ka yi tambaya. Jimla biyu zuwa uku kawai."
+    ),
+}
+
+# tools we never hand to Gemini (cannot be used safely by voice, or have no hardware)
+BLOCKED_TOOL_WORDS = ("upgrade", "reboot", "camera")
+
+
+def tool_schema(js):
+    """MCP inputSchema -> Gemini function parameters (None when the tool takes no arguments)."""
+    types_map = {"integer": "INTEGER", "number": "NUMBER", "boolean": "BOOLEAN", "string": "STRING"}
+    props = {}
+    for k, v in ((js or {}).get("properties") or {}).items():
+        p = {"type": types_map.get(v.get("type"), "STRING")}
+        desc = v.get("description", "")
+        if "minimum" in v or "maximum" in v:
+            desc = (desc + " ").lstrip() + "(%s - %s)" % (v.get("minimum", ""), v.get("maximum", ""))
+        if desc:
+            p["description"] = desc
+        props[k] = p
+    if not props:
+        return None
+    out = {"type": "OBJECT", "properties": props}
+    if js.get("required"):
+        out["required"] = [r for r in js["required"] if r in props]
+    return out
 
 
 def load_key():
@@ -99,6 +141,44 @@ async def robot_ws(request: web.Request):
             obj["session_id"] = session_id
             await ws.send_str(json.dumps(obj, ensure_ascii=False))
 
+    # ---- MCP: lets Gemini call the robot's own tools (lamp, fan, temperature ...)
+    mcp = {"next_id": 100, "pending": {}, "tools": [], "ready": asyncio.Event()}
+    alert_q: asyncio.Queue = asyncio.Queue()
+    bg_tasks = []
+
+    async def mcp_request(method, params=None, timeout=10):
+        mcp["next_id"] += 1
+        rid = mcp["next_id"]
+        fut = asyncio.get_running_loop().create_future()
+        mcp["pending"][rid] = fut
+        msg = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        await send_json({"type": "mcp", "payload": msg})
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            mcp["pending"].pop(rid, None)
+
+    async def mcp_load_tools():
+        try:
+            await mcp_request("initialize", {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "gemini-bridge", "version": "1.0"}})
+            tools, cursor = [], None
+            for _ in range(10):
+                res = await mcp_request("tools/list", {"cursor": cursor} if cursor else {})
+                tools += res.get("tools", [])
+                cursor = res.get("nextCursor")
+                if not cursor:
+                    break
+            mcp["tools"] = tools
+            log(f"[{session_id}] robot tools: " + ", ".join(t.get("name", "?") for t in tools))
+        except Exception as e:
+            log(f"[{session_id}] could not load robot tools: {type(e).__name__}: {e}")
+        finally:
+            mcp["ready"].set()
+
     # ---- task: pace opus frames to the robot
     async def sender():
         sent = 0
@@ -135,9 +215,44 @@ async def robot_ws(request: web.Request):
         if VOICE:
             speech = types.SpeechConfig(voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE)))
+
+        # wait (max 8 s) until we know which tools the robot has
+        try:
+            await asyncio.wait_for(mcp["ready"].wait(), 8)
+        except asyncio.TimeoutError:
+            log(f"[{session_id}] robot tools not ready, continuing without them")
+        decls, tool_names = [], {}
+        for t in mcp["tools"]:
+            real = t.get("name", "")
+            if not real or any(w in real.lower() for w in BLOCKED_TOOL_WORDS):
+                continue
+            gname = real.replace(".", "_")
+            tool_names[gname] = real
+            decls.append(types.FunctionDeclaration(
+                name=gname, description=t.get("description", "")[:900],
+                parameters=tool_schema(t.get("inputSchema"))))
+        tools_cfg = [types.Tool(function_declarations=decls)] if decls else None
+
+        async def run_tool(fc):
+            real = tool_names.get(fc.name)
+            args = {}
+            for k, v in dict(fc.args or {}).items():
+                args[k] = int(v) if isinstance(v, float) and v == int(v) else v
+            try:
+                if not real:
+                    raise RuntimeError("unknown tool")
+                res = await mcp_request("tools/call", {"name": real, "arguments": args}, timeout=10)
+                text = " ".join(c.get("text", "") for c in res.get("content", []) if isinstance(c, dict))
+                out = {"error": text} if res.get("isError") else {"result": text}
+            except Exception as e:
+                out = {"error": f"{type(e).__name__}: {e}"}
+            log(f"[{session_id}] tool {real}({args}) -> {out}")
+            return types.FunctionResponse(id=fc.id, name=fc.name, response=out)
+
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=SYSTEM_PROMPT,
+            tools=tools_cfg,
             speech_config=speech,
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
@@ -167,6 +282,11 @@ async def robot_ws(request: web.Request):
                         t_first = None
                         while True:
                             async for msg in session.receive():
+                                tc = getattr(msg, "tool_call", None)
+                                if tc and tc.function_calls:
+                                    responses = [await run_tool(fc) for fc in tc.function_calls]
+                                    await session.send_tool_response(function_responses=responses)
+                                    continue
                                 sc = msg.server_content
                                 if not sc:
                                     continue
@@ -202,9 +322,18 @@ async def robot_ws(request: web.Request):
                                     said = heard = ""
                                     t_first = None
 
+                    async def alerts_to_gemini():
+                        while True:
+                            key = await alert_q.get()
+                            prompt = ALERT_PROMPTS.get(key)
+                            if prompt:
+                                log(f"[{session_id}] ALERT -> Gemini: {key}")
+                                await session.send_realtime_input(text=prompt)
+
                     t1 = asyncio.create_task(mic_to_gemini())
                     t2 = asyncio.create_task(gemini_to_robot())
-                    done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_EXCEPTION)
+                    t3 = asyncio.create_task(alerts_to_gemini())
+                    done, pending = await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_EXCEPTION)
                     for p in pending:
                         p.cancel()
                     for d in done:
@@ -230,8 +359,22 @@ async def robot_ws(request: web.Request):
                                          "channels": 1, "frame_duration": codec.FRAME_MS},
                     }))
                     log(f"[{session_id}] hello answered")
+                    if (data.get("features") or {}).get("mcp"):
+                        bg_tasks.append(asyncio.create_task(mcp_load_tools()))
+                    else:
+                        mcp["ready"].set()
+                elif t == "mcp":
+                    p = data.get("payload") or {}
+                    fut = mcp["pending"].get(p.get("id"))
+                    if fut and not fut.done():
+                        if "error" in p:
+                            fut.set_exception(RuntimeError(str(p["error"])))
+                        else:
+                            fut.set_result(p.get("result") or {})
                 elif t == "listen":
                     log(f"[{session_id}] listen {data.get('state')} {data.get('text', '')}")
+                    if data.get("state") == "detect" and str(data.get("text", "")).startswith("ALERT_"):
+                        alert_q.put_nowait(str(data["text"]).strip())
                 elif t == "abort":
                     while not out_q.empty():
                         out_q.get_nowait()
@@ -251,7 +394,7 @@ async def robot_ws(request: web.Request):
                     mic_q.put_nowait(pcm)
     finally:
         state["alive"] = False
-        for t in tasks:
+        for t in tasks + bg_tasks:
             t.cancel()
         log(f"[{session_id}] robot disconnected")
     return ws
