@@ -46,6 +46,10 @@ ALERT_PROMPTS = {
     ),
 }
 
+# robot tool list remembered between connections, so a new connection (e.g. a fire alarm)
+# does not have to wait for it
+TOOLS_CACHE = {"tools": []}
+
 # tools we never hand to Gemini (cannot be used safely by voice, or have no hardware)
 BLOCKED_TOOL_WORDS = ("upgrade", "reboot", "camera")
 
@@ -142,7 +146,9 @@ async def robot_ws(request: web.Request):
             await ws.send_str(json.dumps(obj, ensure_ascii=False))
 
     # ---- MCP: lets Gemini call the robot's own tools (lamp, fan, temperature ...)
-    mcp = {"next_id": 100, "pending": {}, "tools": [], "ready": asyncio.Event()}
+    mcp = {"next_id": 100, "pending": {}, "tools": list(TOOLS_CACHE["tools"]), "ready": asyncio.Event()}
+    if mcp["tools"]:
+        mcp["ready"].set()   # use the remembered list right away (refreshed in the background)
     alert_q: asyncio.Queue = asyncio.Queue()
     bg_tasks = []
 
@@ -173,6 +179,7 @@ async def robot_ws(request: web.Request):
                 if not cursor:
                     break
             mcp["tools"] = tools
+            TOOLS_CACHE["tools"] = list(tools)
             log(f"[{session_id}] robot tools: " + ", ".join(t.get("name", "?") for t in tools))
         except Exception as e:
             log(f"[{session_id}] could not load robot tools: {type(e).__name__}: {e}")
