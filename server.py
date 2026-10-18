@@ -30,6 +30,10 @@ SYSTEM_PROMPT = (
     "sannan ka tabbatar masa da Hausa abin da ya faru. Kada ka ce ka yi aiki sai ka ga kayan aikin ya yi nasara. "
     "Idan mutum ya ce 'idan zafi ya kai 39 ka kunna fanka' (ko makamancin haka), ka yi amfani da kayan aikin "
     "saita ka'idar fanka (set_fan_rule) da lambar zafin da ya fada. "
+    "Akwai kuma na'urar gano motsi (PIR). Idan mutum ya ce 'duk lokacin da ka ji motsi ka kunna haske' "
+    "(ko ya ambaci lokaci kamar 'ka kashe bayan minti biyu'), ka yi amfani da kayan aikin motion_light_turn_on "
+    "(seconds = lokacin da zai jira ba tare da motsi ba kafin ya kashe, a cikin dakika; minti 1 = 60). "
+    "Idan ya ce ka daina haka, ka yi amfani da motion_light_turn_off. "
     "Idan ka karbi sako da ya fara da [TSARO], hatsari ne na gaske: ka yi magana nan da nan, da murya mai karfi da gaggawa."
 )
 
