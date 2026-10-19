@@ -40,6 +40,10 @@ SYSTEM_PROMPT = (
     "(ko ya ambaci lokaci kamar 'ka kashe bayan minti biyu'), ka yi amfani da kayan aikin motion_light_turn_on "
     "(seconds = lokacin da zai jira ba tare da motsi ba kafin ya kashe, a cikin dakika; minti 1 = 60). "
     "Idan ya ce ka daina haka, ka yi amfani da motion_light_turn_off. "
+    "Idan mutum ya yi bankwana ko ya nuna yana so ya gama magana da kai (misali 'bye bye', 'goodbye', 'sai an jima', "
+    "'sai gobe', 'mun gode sai wani lokaci', 'ka kashe kanka', 'ka yi shiru ka kwanta'), ka yi amfani da kayan aikin "
+    "end_conversation, sannan ka yi masa bankwana a gajarce (jimla daya) da harshen da ya yi amfani da shi. "
+    "Kada ka yi amfani da shi idan mutum kawai ya ce 'na gode' a cikin tattaunawa. "
     "Idan ka karbi sako da ya fara da [TSARO], hatsari ne na gaske: ka yi magana nan da nan, da murya mai karfi da gaggawa."
 )
 
@@ -148,7 +152,23 @@ async def robot_ws(request: web.Request):
 
     mic_q: asyncio.Queue = asyncio.Queue(maxsize=200)   # PCM 16k chunks robot -> Gemini
     out_q: asyncio.Queue = asyncio.Queue()              # opus frames Gemini -> robot, None = end of turn
-    state = {"speaking": False, "alive": True}
+    state = {"speaking": False, "alive": True, "closing": False, "bye_heard": False}
+
+    async def close_after_speech(delay=0.0):
+        """Wait until the goodbye has been played, then close the connection (robot goes idle)."""
+        try:
+            if delay:
+                await asyncio.sleep(delay)
+            waited = 0.0
+            while (not out_q.empty() or state["speaking"]) and waited < 20:
+                await asyncio.sleep(0.2)
+                waited += 0.2
+            await asyncio.sleep(1.5)   # let the robot finish playing what it buffered
+            log(f"[{session_id}] goodbye: closing the conversation")
+            if not ws.closed:
+                await ws.close()
+        except asyncio.CancelledError:
+            raise
 
     async def send_json(obj):
         if not ws.closed:
@@ -248,6 +268,10 @@ async def robot_ws(request: web.Request):
             decls.append(types.FunctionDeclaration(
                 name=gname, description=t.get("description", "")[:900],
                 parameters=tool_schema(t.get("inputSchema"))))
+        decls.append(types.FunctionDeclaration(
+            name="end_conversation",
+            description="End the conversation when the user says goodbye or wants to stop talking. "
+                        "The robot goes back to sleep and listens only for its wake word."))
         def make_tools(with_search):
             lst = []
             if decls:
@@ -258,6 +282,13 @@ async def robot_ws(request: web.Request):
         search = {"on": os.environ.get("ENABLE_SEARCH", "1") != "0"}
 
         async def run_tool(fc):
+            if fc.name == "end_conversation":
+                state["closing"] = True
+                state["bye_heard"] = False
+                bg_tasks.append(asyncio.create_task(close_after_speech(delay=25)))  # safety net
+                log(f"[{session_id}] user said goodbye")
+                return types.FunctionResponse(id=fc.id, name=fc.name,
+                    response={"result": "ok. Now say a very short goodbye in the user's language."})
             real = tool_names.get(fc.name)
             args = {}
             for k, v in dict(fc.args or {}).items():
@@ -331,6 +362,8 @@ async def robot_ws(request: web.Request):
                                 if sc.model_turn:
                                     for part in sc.model_turn.parts or []:
                                         if part.inline_data and part.inline_data.data:
+                                            if state["closing"]:
+                                                state["bye_heard"] = True
                                             if t_first is None:
                                                 t_first = time.monotonic()
                                             buf += part.inline_data.data
@@ -345,6 +378,9 @@ async def robot_ws(request: web.Request):
                                             await out_q.put(pkt)
                                         buf = b""
                                     await out_q.put(None)
+                                    if state["closing"] and state["bye_heard"]:
+                                        bg_tasks.append(asyncio.create_task(close_after_speech()))
+                                        state["closing"] = False
                                     log(f"[{session_id}] turn done. heard='{heard}' said='{said}'")
                                     said = heard = ""
                                     t_first = None
