@@ -22,7 +22,13 @@ SILENCE_MS = int(os.environ.get("SILENCE_MS", "600"))  # wait this long after yo
 
 SYSTEM_PROMPT = (
     "Sunanka Robot. Kai mataimaki ne mai fara'a a cikin wani karamin robot a gidan Alhassan a Nigeria. "
-    "Ka fahimci Hausa, kuma KA AMSA DA HAUSA KAWAI sai dai idan mutum ya nemi wani harshe. "
+    "Kana magana da Hausa da Turanci kawai. Idan mutum ya yi magana da Hausa, ka amsa da Hausa. "
+    "Idan ya yi magana da Turanci, ka amsa da Turanci. Kada ka taba amsa da wani harshe daban, "
+    "ko da an yi maka magana da wani harshe: ka amsa da Hausa. "
+    "Ka amsa duk tambayoyi: ilimi na duniya, tarihi, kimiyya, mutane da shahararrun mutane, labarai, lissafi, da sauransu. "
+    "Idan ba ka da tabbaci ko tambayar ta shafi abin da ke faruwa yanzu ko wani mutum, ka yi amfani da binciken Google. "
+    "Kada ka ce 'ba ni da kayan aiki' ko 'ba zan iya bincike ba' kafin ka gwada; idan ka bincika ba ka samu ba, "
+    "ka ce ba ka sani ba cikin gaskiya. "
     "Ka yi gajerun amsoshi (jimla daya zuwa uku) domin ana jin su ta lasifika. "
     "Kada ka yi amfani da alamomi ko emoji. Ka yi magana a hankali da bayyananniyar murya. "
     "Kana iya sarrafa na'urorin gidan ta hanyar kayan aiki (tools): fitila, fanka, da karanta zafi da danshin dakin. "
@@ -242,7 +248,14 @@ async def robot_ws(request: web.Request):
             decls.append(types.FunctionDeclaration(
                 name=gname, description=t.get("description", "")[:900],
                 parameters=tool_schema(t.get("inputSchema"))))
-        tools_cfg = [types.Tool(function_declarations=decls)] if decls else None
+        def make_tools(with_search):
+            lst = []
+            if decls:
+                lst.append(types.Tool(function_declarations=decls))
+            if with_search:
+                lst.append(types.Tool(google_search=types.GoogleSearch()))
+            return lst or None
+        search = {"on": os.environ.get("ENABLE_SEARCH", "1") != "0"}
 
         async def run_tool(fc):
             real = tool_names.get(fc.name)
@@ -260,25 +273,28 @@ async def robot_ws(request: web.Request):
             log(f"[{session_id}] tool {real}({args}) -> {out}")
             return types.FunctionResponse(id=fc.id, name=fc.name, response=out)
 
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction=SYSTEM_PROMPT,
-            tools=tools_cfg,
-            speech_config=speech,
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    silence_duration_ms=SILENCE_MS,
-                    prefix_padding_ms=100,
-                )
-            ),
-        )
+        def make_config():
+            return types.LiveConnectConfig(
+                response_modalities=["AUDIO"],
+                system_instruction=SYSTEM_PROMPT,
+                tools=make_tools(search["on"]),
+                speech_config=speech,
+                input_audio_transcription=types.AudioTranscriptionConfig(),
+                output_audio_transcription=types.AudioTranscriptionConfig(),
+                realtime_input_config=types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        silence_duration_ms=SILENCE_MS,
+                        prefix_padding_ms=100,
+                    )
+                ),
+            )
         while state["alive"]:
             try:
+                connected = False
                 log(f"[{session_id}] connecting to Gemini ({MODEL}) ...")
-                async with client.aio.live.connect(model=MODEL, config=config) as session:
-                    log(f"[{session_id}] Gemini connected")
+                async with client.aio.live.connect(model=MODEL, config=make_config()) as session:
+                    connected = True
+                    log(f"[{session_id}] Gemini connected (search={search['on']})")
 
                     async def mic_to_gemini():
                         while True:
@@ -353,6 +369,9 @@ async def robot_ws(request: web.Request):
                 raise
             except Exception as e:
                 log(f"[{session_id}] Gemini error: {type(e).__name__}: {e}")
+                if not connected and search["on"]:
+                    search["on"] = False   # maybe this model refuses Google Search + tools: retry without it
+                    log(f"[{session_id}] retrying without Google Search")
                 await asyncio.sleep(2)
 
     tasks = [asyncio.create_task(sender()), asyncio.create_task(gemini_task())]
