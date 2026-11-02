@@ -3,6 +3,7 @@ Robot <-> Gemini Live bridge (test version, runs on your own computer).
 
 Robot (xiaozhi firmware)  <--WebSocket/Opus-->  this server  <--Gemini Live API-->  Google
 """
+import aiohttp
 import asyncio
 import json
 import os
@@ -49,6 +50,13 @@ SYSTEM_PROMPT = (
     "'Barka da zuwa, Maigida Alhassan! Ina fatan kana lafiya. Ya ya aiki? Me zan yi maka yau?' "
     "ka yi amfani da kalmomi masu daraja da tsafta, ka kira shi 'Maigida Alhassan', ka tuna da wannan har karshen tattaunawar. "
     "Ga sauran mutane, ka yi musu magana cikin ladabi da kirki. "
+    "KARATU ZUWA WAYA: idan mutum ya nemi ka aika masa amsa, ma'ana, ko abin da kuka tattauna/yi nazari a kai zuwa wayarsa "
+    "(misali 'ka aika min amsar zuwa waya', 'ka turo min abin da muka karanta'), ka tattara abin da kuka yi nazari a kai "
+    "a wannan tattaunawar, ka rubuta shi a tsabtace, a takaice kuma a fahimta (taken, ma'ana, misali idan akwai) da harshen karatun, "
+    "sannan ka yi amfani da kayan aikin send_to_phone, ka ce masa an aika. Idan ba ku yi wani nazari ba tukuna, ka tambaye shi me yake so a aika. "
+    "IDANU DA TSARO: idan ya nemi wasan idanu ko wani launi, yi amfani da self_eyes_show (misali effect rainbow, seconds 10); "
+    "idan ya ce zai fita (misali 'ina fita yanzu'), yi amfani da self_away_start ka ce masa ka fara tsaro; "
+    "idan ya ce ya dawo, yi amfani da self_away_stop. "
     "Idan mutum ya yi bankwana ko ya nuna yana so ya gama magana da kai (misali 'bye bye', 'goodbye', 'sai an jima', "
     "'sai gobe', 'mun gode sai wani lokaci', 'ka kashe kanka', 'ka yi shiru ka kwanta'), ka yi amfani da kayan aikin "
     "end_conversation, sannan ka yi masa bankwana a gajarce (jimla daya) da harshen da ya yi amfani da shi. "
@@ -144,6 +152,31 @@ async def health(request: web.Request):
 
 
 # ---------------------------------------------------------------- one robot connection
+NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
+NTFY_STUDY_TOPIC = os.environ.get("NTFY_STUDY_TOPIC", "robot-karatu-48d8f7f3364fd324")
+
+
+async def send_to_phone(title, message):
+    """Send a study note to the phone through ntfy (JSON publish keeps Hausa letters intact)."""
+    payload = {
+        "topic": NTFY_STUDY_TOPIC,
+        "title": (title or "Karatu")[:100],
+        "message": (message or "")[:3800],
+        "tags": ["books"],
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            async with http.post(NTFY_SERVER, json=payload) as r:
+                ok = r.status == 200
+                log(f"ntfy study note: status {r.status}")
+                return ok
+    except Exception as e:
+        log(f"ntfy study note failed: {e}")
+        return False
+
+
+
 async def robot_ws(request: web.Request):
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=0)
     await ws.prepare(request)
@@ -278,6 +311,14 @@ async def robot_ws(request: web.Request):
                 name=gname, description=t.get("description", "")[:900],
                 parameters=tool_schema(t.get("inputSchema"))))
         decls.append(types.FunctionDeclaration(
+            name="send_to_phone",
+            description="Send a written note (what the user studied or asked, the answer, a meaning) to the user's phone "
+                        "through the ntfy app. Write the note clearly in the language of the lesson.",
+            parameters={"type": "OBJECT",
+                        "properties": {"title": {"type": "STRING", "description": "Short title, e.g. the topic"},
+                                       "message": {"type": "STRING", "description": "The full note to send"}},
+                        "required": ["title", "message"]}))
+        decls.append(types.FunctionDeclaration(
             name="end_conversation",
             description="End the conversation when the user says goodbye or wants to stop talking. "
                         "The robot goes back to sleep and listens only for its wake word."))
@@ -298,6 +339,11 @@ async def robot_ws(request: web.Request):
                 log(f"[{session_id}] user said goodbye")
                 return types.FunctionResponse(id=fc.id, name=fc.name,
                     response={"result": "ok. Now say a very short goodbye in the user's language."})
+            if fc.name == "send_to_phone":
+                a = dict(fc.args or {})
+                ok = await send_to_phone(a.get("title"), a.get("message"))
+                return types.FunctionResponse(id=fc.id, name=fc.name,
+                    response={"result": "sent to the phone" if ok else "failed to send, tell the user it did not go through"})
             real = tool_names.get(fc.name)
             args = {}
             for k, v in dict(fc.args or {}).items():
