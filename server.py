@@ -5,6 +5,7 @@ Robot (xiaozhi firmware)  <--WebSocket/Opus-->  this server  <--Gemini Live API-
 """
 import aiohttp
 import asyncio
+import hmac
 import json
 import os
 import socket
@@ -132,6 +133,75 @@ def log(*a):
 
 
 # ---------------------------------------------------------------- OTA endpoint
+# ---------------------------------------------------------------- room control (second ESP32 at the wall switch)
+# The ESP32 at the switch box asks this server (long polling) for the wanted state of 3 lamps and 1 fan.
+# ROOM_TOKEN must be set in Render -> Environment (never in the code: the repo is public).
+# ROOM_LAMP_NAMES (optional): names of the 3 lamps, separated by commas, e.g. "falo,tebur,kofa".
+ROOM_TOKEN = os.environ.get("ROOM_TOKEN", "")
+ROOM_FAN_NAME = os.environ.get("ROOM_FAN_NAME", "fanka")
+_lamp_names = [n.strip() for n in os.environ.get(
+    "ROOM_LAMP_NAMES", "fitila ta daya,fitila ta biyu,fitila ta uku").split(",") if n.strip()]
+while len(_lamp_names) < 3:
+    _lamp_names.append(f"fitila ta {len(_lamp_names) + 1}")
+ROOM_LAMPS = _lamp_names[:3]
+ROOM_KEYS = ["lamp1", "lamp2", "lamp3", "fan"]
+# None = no command yet since the server started (the device then keeps what it has).
+room = {"v": 0, "state": {k: None for k in ROOM_KEYS}, "seen": 0.0, "waiters": []}
+
+SYSTEM_PROMPT += (
+    "FITILOLI DA FANKA NA DAKI (a bango): ana sarrafa su da kayan aikin room_control. "
+    f"device = lamp1 ({ROOM_LAMPS[0]}), lamp2 ({ROOM_LAMPS[1]}), lamp3 ({ROOM_LAMPS[2]}), fan ({ROOM_FAN_NAME}). "
+    "Idan mutum ya ambaci sunan fitila, ka kunna ko ka kashe ita kadai, kada ka taba sauran. "
+    "Ka yi amfani da all_lamps ne kawai idan ya ce ka kunna ko ka kashe duka fitilun. "
+    "Kayan aikin self_lamp da self_fan na jikin robot ne; kada ka yi amfani da su sai mutum ya ce 'fitilar robot' ko 'fanka na robot'. "
+    "Idan room_control ya ce na'urar bango ba ta hade ba, ka gaya masa cewa na'urar da ke bango ba ta hade da WiFi. "
+)
+
+
+def room_set(device, on):
+    """Store the wanted state and wake the polling device. Returns a text for Gemini."""
+    if not ROOM_TOKEN:
+        return "failed: room control is not set up on the server"
+    if time.time() - room["seen"] > 45:
+        return "failed: the device at the wall switch is not connected to Wi-Fi right now"
+    keys = ROOM_KEYS[:3] if device == "all_lamps" else ([device] if device in ROOM_KEYS else [])
+    if not keys:
+        return "failed: unknown device " + str(device)
+    for k in keys:
+        room["state"][k] = bool(on)
+    room["v"] += 1
+    for f in room["waiters"]:
+        if not f.done():
+            f.set_result(True)
+    log(f"room: {keys} -> {'ON' if on else 'OFF'} (v{room['v']})")
+    return "ok: " + ", ".join(keys) + (" on" if on else " off")
+
+
+async def room_poll(request: web.Request):
+    if not ROOM_TOKEN:
+        return web.json_response({"error": "disabled"}, status=503)
+    if not hmac.compare_digest(request.query.get("token", ""), ROOM_TOKEN):
+        return web.json_response({"error": "bad token"}, status=401)
+    room["seen"] = time.time()
+    try:
+        since = int(request.query.get("since", "-1"))
+    except ValueError:
+        since = -1
+    if since == room["v"]:
+        fut = asyncio.get_running_loop().create_future()
+        room["waiters"].append(fut)
+        try:
+            await asyncio.wait_for(fut, 20)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            if fut in room["waiters"]:
+                room["waiters"].remove(fut)
+        room["seen"] = time.time()
+    st = {k: (None if v is None else int(v)) for k, v in room["state"].items()}
+    return web.json_response({"v": room["v"], "state": st})
+
+
 async def ota(request: web.Request):
     # behind a proxy (GitHub Codespaces) the real scheme/host come in these headers
     host = request.headers.get("X-Forwarded-Host", request.host)
@@ -311,6 +381,14 @@ async def robot_ws(request: web.Request):
                 name=gname, description=t.get("description", "")[:900],
                 parameters=tool_schema(t.get("inputSchema"))))
         decls.append(types.FunctionDeclaration(
+            name="room_control",
+            description="Turn a lamp or the fan of the room on or off (wired at the wall switch). "
+                        "device: lamp1, lamp2, lamp3, fan, or all_lamps (only when the user asks for all the lamps).",
+            parameters={"type": "OBJECT",
+                        "properties": {"device": {"type": "STRING", "description": "lamp1, lamp2, lamp3, fan or all_lamps"},
+                                       "on": {"type": "BOOLEAN", "description": "true = on, false = off"}},
+                        "required": ["device", "on"]}))
+        decls.append(types.FunctionDeclaration(
             name="send_to_phone",
             description="Send a written note (what the user studied or asked, the answer, a meaning) to the user's phone "
                         "through the ntfy app. Write the note clearly in the language of the lesson.",
@@ -339,6 +417,10 @@ async def robot_ws(request: web.Request):
                 log(f"[{session_id}] user said goodbye")
                 return types.FunctionResponse(id=fc.id, name=fc.name,
                     response={"result": "ok. Now say a very short goodbye in the user's language."})
+            if fc.name == "room_control":
+                a = dict(fc.args or {})
+                res = room_set(str(a.get("device", "")), bool(a.get("on")))
+                return types.FunctionResponse(id=fc.id, name=fc.name, response={"result": res})
             if fc.name == "send_to_phone":
                 a = dict(fc.args or {})
                 ok = await send_to_phone(a.get("title"), a.get("message"))
@@ -537,6 +619,7 @@ def main():
     app.router.add_route("*", "/xiaozhi/ota/", ota)
     app.router.add_get("/xiaozhi/v1/", robot_ws)
     app.router.add_get("/health", health)
+    app.router.add_get("/room/state", room_poll)
     app.router.add_get("/", health)
     print("=" * 60)
     cs_name = os.environ.get("CODESPACE_NAME")
