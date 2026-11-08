@@ -11,6 +11,7 @@ import os
 import socket
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web, WSMsgType
 
@@ -202,6 +203,48 @@ async def room_poll(request: web.Request):
     return web.json_response({"v": room["v"], "state": st})
 
 
+# ---------------------------------------------------------------- identity, time, family, Quran
+# Family notes are private: they are read from a Render "Secret File" (/etc/secrets/family.txt) or from the
+# FAMILY_INFO environment variable, never from this public code.
+def load_family_info():
+    for path in ("/etc/secrets/family.txt",):
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read().strip()
+                if text:
+                    return text
+        except OSError:
+            pass
+    return os.environ.get("FAMILY_INFO", "").strip()
+
+
+FAMILY_INFO = load_family_info()
+NIGERIA_TZ = timezone(timedelta(hours=1))   # Nigeria (WAT) has no daylight saving time
+
+
+def nigeria_time_text():
+    return datetime.now(NIGERIA_TZ).strftime("%A, %d %B %Y, %H:%M") + " (Nigeria time, WAT, UTC+1)"
+
+
+SYSTEM_PROMPT += (
+    "SUNA: sunanka robot. Idan aka kira ka 'Kira' ko 'Hey Kira', ka amsa, domin wannan kalmar tada ka ce. "
+    "Amma idan aka tambaye ka sunanka, ka ce 'Ni robot ne', kada ka ce sunanka Kira. "
+    "LOKACI: kullum lokacin Najeriya kake amfani da shi (UTC+1), ba na wata kasa ba. Idan aka tambaye ka lokaci, ranar yau, "
+    "ko wane wata ne, ka yi amfani da kayan aikin get_time kafin ka amsa, kada ka kintata. "
+    "HAUSA: ka yi magana da Hausa mai kyau, sulbi da dadin ji, kamar yadda ake yi a Arewacin Najeriya, cikin natsuwa, "
+    "kana iya hada kalmomin Turanci idan hakan ya fi dadi. "
+    "AL-QUR'ANI: idan aka ce ka karanta Al-Qur'ani (sura ko aya), ka karanta shi da Larabci (wannan ya fita daga ka'idar Hausa da Turanci kawai), da kyau, a hankali, "
+    "kamar yadda yake a mushafi, da tajwidi gwargwadon iko. Ka fara da A'udhu billahi minash shaitanir rajim da Bismillah. "
+    "Kada ka kara ko ka rage kalma; idan ba ka da tabbaci game da wata aya, ka tsaya ka fada hakan maimakon ka kirkiri kalma. "
+    "A wannan yanayin ba sai amsarka ta zama gajeriya ba: ka ci gaba da karantawa har ka kammala abin da aka nema. "
+)
+if FAMILY_INFO:
+    SYSTEM_PROMPT += "\n\n" + FAMILY_INFO + "\n"
+    log(f"family notes loaded ({len(FAMILY_INFO)} characters)")
+else:
+    log("no family notes found (add the secret file family.txt in Render)")
+
+
 async def ota(request: web.Request):
     # behind a proxy (GitHub Codespaces) the real scheme/host come in these headers
     host = request.headers.get("X-Forwarded-Host", request.host)
@@ -381,6 +424,9 @@ async def robot_ws(request: web.Request):
                 name=gname, description=t.get("description", "")[:900],
                 parameters=tool_schema(t.get("inputSchema"))))
         decls.append(types.FunctionDeclaration(
+            name="get_time",
+            description="Get the current date and time in Nigeria (WAT, UTC+1). Use it whenever the user asks the time or the date."))
+        decls.append(types.FunctionDeclaration(
             name="room_control",
             description="Turn a lamp or the fan of the room on or off (wired at the wall switch). "
                         "device: lamp1, lamp2, lamp3, fan, or all_lamps (only when the user asks for all the lamps).",
@@ -417,6 +463,8 @@ async def robot_ws(request: web.Request):
                 log(f"[{session_id}] user said goodbye")
                 return types.FunctionResponse(id=fc.id, name=fc.name,
                     response={"result": "ok. Now say a very short goodbye in the user's language."})
+            if fc.name == "get_time":
+                return types.FunctionResponse(id=fc.id, name=fc.name, response={"result": nigeria_time_text()})
             if fc.name == "room_control":
                 a = dict(fc.args or {})
                 res = room_set(str(a.get("device", "")), bool(a.get("on")))
@@ -444,7 +492,7 @@ async def robot_ws(request: web.Request):
         def make_config():
             return types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=SYSTEM_PROMPT + "\nLOKACI YANZU (Najeriya): " + nigeria_time_text() + ".",
                 tools=make_tools(search["on"]),
                 speech_config=speech,
                 input_audio_transcription=types.AudioTranscriptionConfig(),
