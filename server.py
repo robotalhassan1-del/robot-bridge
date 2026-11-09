@@ -107,6 +107,32 @@ def tool_schema(js):
     return out
 
 
+def coerce_args(props, args):
+    """Make the values Gemini sends match the types the robot's tool declares
+    (for example the number 38.3 becomes the text "38.3" when the tool wants text)."""
+    out = {}
+    for k, v in args.items():
+        ty = ((props or {}).get(k) or {}).get("type")
+        try:
+            if ty == "string" and not isinstance(v, str):
+                if isinstance(v, bool):
+                    v = str(v).lower()
+                elif isinstance(v, float):
+                    v = "%g" % v
+                else:
+                    v = str(v)
+            elif ty == "integer" and not isinstance(v, bool) and isinstance(v, (float, str)):
+                v = int(round(float(v)))
+            elif ty == "number" and isinstance(v, str):
+                v = float(v)
+            elif ty == "boolean" and isinstance(v, str):
+                v = v.strip().lower() in ("true", "1", "yes", "on")
+        except ValueError:
+            pass
+        out[k] = v
+    return out
+
+
 def load_key():
     key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
@@ -443,13 +469,14 @@ async def robot_ws(request: web.Request):
             await asyncio.wait_for(mcp["ready"].wait(), 8)
         except asyncio.TimeoutError:
             log(f"[{session_id}] robot tools not ready, continuing without them")
-        decls, tool_names = [], {}
+        decls, tool_names, tool_props = [], {}, {}
         for t in mcp["tools"]:
             real = t.get("name", "")
             if not real or any(w in real.lower() for w in BLOCKED_TOOL_WORDS):
                 continue
             gname = real.replace(".", "_")
             tool_names[gname] = real
+            tool_props[real] = (t.get("inputSchema") or {}).get("properties") or {}
             decls.append(types.FunctionDeclaration(
                 name=gname, description=t.get("description", "")[:900],
                 parameters=tool_schema(t.get("inputSchema"))))
@@ -505,9 +532,10 @@ async def robot_ws(request: web.Request):
                 return types.FunctionResponse(id=fc.id, name=fc.name,
                     response={"result": "sent to the phone" if ok else "failed to send, tell the user it did not go through"})
             real = tool_names.get(fc.name)
-            args = {}
-            for k, v in dict(fc.args or {}).items():
-                args[k] = int(v) if isinstance(v, float) and v == int(v) else v
+            args = coerce_args(tool_props.get(real, {}), dict(fc.args or {}))
+            for k, v in list(args.items()):
+                if isinstance(v, float) and v == int(v) and (tool_props.get(real, {}).get(k) or {}).get("type") != "number":
+                    args[k] = int(v)
             try:
                 if not real:
                     raise RuntimeError("unknown tool")
