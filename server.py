@@ -402,7 +402,9 @@ async def robot_ws(request: web.Request):
     async def gemini_task():
         from google import genai
         from google.genai import types
-        client = genai.Client(api_key=load_key())
+        # The Live API for API keys lives on v1beta; we force it so a newer SDK default cannot change the address.
+        client = genai.Client(api_key=load_key(),
+                              http_options=types.HttpOptions(api_version=os.environ.get("GEMINI_API_VERSION", "v1beta")))
         speech = None
         if VOICE:
             speech = types.SpeechConfig(voice_config=types.VoiceConfig(
@@ -662,6 +664,11 @@ def main():
         codec.make_codec()
     except Exception as e:
         print("OPUS warm-up error:", e, flush=True)
+    try:
+        from importlib.metadata import version as _v
+        print("versions: google-genai", _v("google-genai"), "| websockets", _v("websockets"), "| aiohttp", _v("aiohttp"), flush=True)
+    except Exception as e:
+        print("version check failed:", e, flush=True)
     print("warm-up done in %.1f s" % (time.monotonic() - t0), flush=True)
     app = web.Application()
     app.router.add_route("*", "/xiaozhi/ota/", ota)
