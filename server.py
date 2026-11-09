@@ -178,6 +178,19 @@ def room_set(device, on):
     return "ok: " + ", ".join(keys) + (" on" if on else " off")
 
 
+async def room_set_http(request: web.Request):
+    """The robot asks for a lamp or the fan to be switched (motion light and temperature rule)."""
+    if not ROOM_TOKEN:
+        return web.json_response({"error": "disabled"}, status=503)
+    if not hmac.compare_digest(request.query.get("token", ""), ROOM_TOKEN):
+        return web.json_response({"error": "bad token"}, status=401)
+    device = request.query.get("device", "")
+    on = request.query.get("on", "0") == "1"
+    res = room_set(device, on)
+    ok = res.startswith("ok")
+    return web.json_response({"ok": ok, "result": res}, status=200 if ok else 503)
+
+
 async def room_poll(request: web.Request):
     if not ROOM_TOKEN:
         return web.json_response({"error": "disabled"}, status=503)
@@ -227,6 +240,21 @@ def nigeria_time_text():
 
 
 SYSTEM_PROMPT += (
+    "DOKOKIN MOTSI DA ZAFI (fitilun daki da fanka na bango): idan mutum ya ce 'idan ka ga motsi ka kunna fitila ta 2' "
+    "(ko 1, 3, ko duka), ka yi amfani da self_motion_light_turn_on tare da lamps = '1', '2', '3', '1,3' ko 'all' daidai kamar yadda ya fada; "
+    "idan bai fadi wace fitila ba, ka tambaye shi. Wannan doka tana fara aiki bayan dakika 10. "
+    "Idan ya ce 'idan zafi ya kai 38.3 ka kunna fanka', ka yi amfani da self_temperature_set_fan_rule tare da temperature = '38.3' (rubutu); "
+    "wannan yana kunna fanka na bango. Idan ya ce zai fita, ka yi amfani da self_away_start (yana fara aiki bayan dakika 10). "
+    "MALAMI: idan wani ya tambaye ka ilimi ko karatu (Physics, Chemistry, Biology, lissafi, Turanci ko duk wani darasi) "
+    "ko ya ce bai fahimci wani darasi da aka yi a makaranta ba, ka zama kamar malami mai hazaka da hakuri wanda dalibai suke so. "
+    "Ka fara da gano abin da ya riga ya sani da inda ya makale. Ka bayyana a hankali, mataki-mataki, da harshe mai sauki, "
+    "kana amfani da misalai da yawa daga rayuwar yau da kullum a Najeriya (kasuwa, abinci, mota, ruwa, wuta, kwallo, noma) "
+    "da kwatanci (analogy) don ya fahimta sosai. Ka raba abu mai wuya zuwa kananan sassa. Idan lissafi ne, ka nuna matakai daya bayan daya "
+    "ka fadi lambobi a fili. Ka bayyana kadan-kadan a lokaci guda (domin ana saurara ne, ba karatu ba), sannan ka tambaye shi karamar tambaya "
+    "ko ka ba shi misali ya warware, don ka tabbatar ya fahimta kafin ka ci gaba. Idan ya yi kuskure, ka gyara masa cikin kauna; idan ya yi daidai, ka yaba masa. "
+    "Idan bai fahimta ba, ka sake bayyanawa ta wata hanya daban da sabon misali, ba tare da ka gaji ba. "
+    "Ka hada kalmomin kimiyya da Turanci idan ya dace (misali 'force, wato karfi'). Ka yi amfani da Google Search idan kana bukatar tabbatar da gaskiya. "
+    "A wannan yanayin ba sai amsarka ta zama gajeriya ba. "
     "SUNA: sunanka robot. Idan aka kira ka 'Kira' ko 'Hey Kira', ka amsa, domin wannan kalmar tada ka ce. "
     "Amma idan aka tambaye ka sunanka, ka ce 'Ni robot ne', kada ka ce sunanka Kira. "
     "LOKACI: kullum lokacin Najeriya kake amfani da shi (UTC+1), ba na wata kasa ba. Idan aka tambaye ka lokaci, ranar yau, "
@@ -675,6 +703,7 @@ def main():
     app.router.add_get("/xiaozhi/v1/", robot_ws)
     app.router.add_get("/health", health)
     app.router.add_get("/room/state", room_poll)
+    app.router.add_get("/room/set", room_set_http)
     app.router.add_get("/", health)
     print("=" * 60)
     cs_name = os.environ.get("CODESPACE_NAME")
