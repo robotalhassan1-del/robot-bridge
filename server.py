@@ -268,7 +268,7 @@ def nigeria_time_text():
 SYSTEM_PROMPT += (
     "DOKOKIN MOTSI DA ZAFI (fitilun daki da fanka na bango): idan mutum ya ce 'idan ka ga motsi ka kunna fitila ta 2' "
     "(ko 1, 3, ko duka), ka yi amfani da self_motion_light_turn_on tare da lamps = '1', '2', '3', '1,3' ko 'all' daidai kamar yadda ya fada; "
-    "idan bai fadi wace fitila ba, ka tambaye shi. Wannan doka tana fara aiki bayan dakika 10. "
+    "idan bai fadi wace fitila ba, ka tambaye shi. Wannan doka tana fara aiki bayan dakika 10. Fitila tana kashewa bayan dakika 10 ba tare da motsi ba (seconds = 10) sai idan ya ambaci wani lokaci daban; idan aka sake ganin motsi, sai ta sake kunnawa. "
     "Idan ya ce 'idan zafi ya kai 38.3 ka kunna fanka', ka yi amfani da self_temperature_set_fan_rule tare da temperature = '38.3' (rubutu); "
     "wannan yana kunna fanka na bango. Idan ya ce zai fita, ka yi amfani da self_away_start (yana fara aiki bayan dakika 10). "
     "MALAMI: idan wani ya tambaye ka ilimi ko karatu (Physics, Chemistry, Biology, lissafi, Turanci ko duk wani darasi) "
@@ -287,10 +287,7 @@ SYSTEM_PROMPT += (
     "ko wane wata ne, ka yi amfani da kayan aikin get_time kafin ka amsa, kada ka kintata. "
     "HAUSA: ka yi magana da Hausa mai kyau, sulbi da dadin ji, kamar yadda ake yi a Arewacin Najeriya, cikin natsuwa, "
     "kana iya hada kalmomin Turanci idan hakan ya fi dadi. "
-    "AL-QUR'ANI: idan aka ce ka karanta Al-Qur'ani (sura ko aya), ka karanta shi da Larabci (wannan ya fita daga ka'idar Hausa da Turanci kawai), da kyau, a hankali, "
-    "kamar yadda yake a mushafi, da tajwidi gwargwadon iko. Ka fara da A'udhu billahi minash shaitanir rajim da Bismillah. "
-    "Kada ka kara ko ka rage kalma; idan ba ka da tabbaci game da wata aya, ka tsaya ka fada hakan maimakon ka kirkiri kalma. "
-    "A wannan yanayin ba sai amsarka ta zama gajeriya ba: ka ci gaba da karantawa har ka kammala abin da aka nema. "
+    "AL-QUR'ANI: idan aka ce ka karanta Al-Qur'ani, ka karanta shi. "
 )
 if FAMILY_INFO:
     SYSTEM_PROMPT += "\n\n" + FAMILY_INFO + "\n"
@@ -478,7 +475,7 @@ async def robot_ws(request: web.Request):
             tool_names[gname] = real
             tool_props[real] = (t.get("inputSchema") or {}).get("properties") or {}
             decls.append(types.FunctionDeclaration(
-                name=gname, description=t.get("description", "")[:900],
+                name=gname, description=t.get("description", "").replace("(default 60)", "(default 10)")[:900],
                 parameters=tool_schema(t.get("inputSchema"))))
         decls.append(types.FunctionDeclaration(
             name="get_time",
@@ -533,6 +530,8 @@ async def robot_ws(request: web.Request):
                     response={"result": "sent to the phone" if ok else "failed to send, tell the user it did not go through"})
             real = tool_names.get(fc.name)
             args = coerce_args(tool_props.get(real, {}), dict(fc.args or {}))
+            if real == "self.motion_light.turn_on" and "seconds" not in args:
+                args["seconds"] = 10   # lamps go off after 10 seconds without movement, unless the user says otherwise
             for k, v in list(args.items()):
                 if isinstance(v, float) and v == int(v) and (tool_props.get(real, {}).get(k) or {}).get("type") != "number":
                     args[k] = int(v)
